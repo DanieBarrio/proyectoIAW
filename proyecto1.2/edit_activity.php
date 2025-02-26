@@ -9,36 +9,55 @@ if (!isset($_SESSION['user']) || $_SESSION['rol'] !== 'ad') {
 }
 
 $conn = conectar();
+$error = '';
+$success = '';
 
-// Obtener ID de la actividad
-$actividad_id = (int)$_GET['id'];
+// Obtener departamentos, tipos y horas disponibles
+$departamentos = $conn->query("SELECT * FROM departamento");
+$tipos = $conn->query("SELECT * FROM tipo");
+$horas = $conn->query("SELECT * FROM horas ORDER BY hora");
 
-try {
-    // Verificar si la actividad existe
-    $stmt = $conn->prepare("SELECT * FROM actividades WHERE id = ?");
-    $stmt->bind_param("i", $actividad_id);
-    $stmt->execute();
-    $result = $stmt->get_result();
-    $actividad = $result->fetch_assoc();
-    if (!$actividad) {
-        throw new Exception("Actividad no encontrada");
-    }
-
-    // Obtener acompañantes actuales
-    $stmt_acomp = $conn->prepare("SELECT profesor_id FROM acompanante WHERE actividad_id = ?");
-    $stmt_acomp->bind_param("i", $actividad_id);
-    $stmt_acomp->execute();
-    $result_acomp = $stmt_acomp->get_result();
-    $acompanantes_actuales = [];
-    while ($row = $result_acomp->fetch_assoc()) {
-        $acompanantes_actuales[] = $row['profesor_id'];
-    }
-} catch (Exception $e) {
-    $error = $e->getMessage();
+// Verificar si se proporcionó un ID válido
+if (!isset($_GET['id']) || !ctype_digit($_GET['id'])) {
+    $_SESSION['error'] = "ID de actividad inválido";
+    header("Location: index.php");
+    exit;
 }
 
-// Procesar actualización si se envió el formulario
-if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($actividad_id)) {
+$actividad_id = (int)$_GET['id'];
+
+// Función para obtener profesores por departamento
+function getProfesoresByDepartamento($conn, $departamento_id) {
+    $stmt = $conn->prepare("SELECT id, nombre FROM profesores WHERE id_departamento = ?");
+    $stmt->bind_param("i", $departamento_id);
+    $stmt->execute();
+    return $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+}
+
+// Obtener datos de la actividad existente
+$stmt = $conn->prepare("SELECT * FROM actividades WHERE id = ?");
+$stmt->bind_param("i", $actividad_id);
+$stmt->execute();
+$actividad = $stmt->get_result()->fetch_assoc();
+
+if (!$actividad) {
+    $_SESSION['error'] = "Actividad no encontrada";
+    header("Location: index.php");
+    exit;
+}
+
+// Obtener acompañantes actuales
+$stmt = $conn->prepare("SELECT profesor_id FROM acompañante WHERE actividad_id = ?");
+$stmt->bind_param("i", $actividad_id);
+$stmt->execute();
+$result = $stmt->get_result();
+$acompanantes_actuales = [];
+while ($row = $result->fetch_assoc()) {
+    $acompanantes_actuales[] = $row['profesor_id'];
+}
+
+// Procesar el formulario si se envió
+if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     try {
         $conn->begin_transaction();
 
@@ -77,46 +96,43 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($actividad_id)) {
         // Validación de fechas y horas
         $fecha_inicio = new DateTime($_POST['fecha_inicio']);
         $fecha_fin = new DateTime($_POST['fecha_fin']);
-        $hora_inicio = $_POST['hora_inicio'];
-        $hora_fin = $_POST['hora_fin'];
+        $hora_inicio = new DateTime("@" . strtotime($_POST['fecha_inicio'] . " " . $_POST['hora_inicio']));
+        $hora_fin = new DateTime("@" . strtotime($_POST['fecha_fin'] . " " . $_POST['hora_fin']));
 
         if ($fecha_fin < $fecha_inicio) {
             throw new Exception("La fecha final no puede ser anterior a la inicial");
         }
-        if ($fecha_inicio == $fecha_fin && strtotime($hora_fin) <= strtotime($hora_inicio)) {
-            throw new Exception("La hora final debe ser posterior a la hora inicial en el mismo día");
+        if ($fecha_inicio == $fecha_fin && $hora_fin < $hora_inicio) {
+            throw new Exception("La hora final no puede ser anterior a la hora inicial en el mismo día");
         }
 
-        // Validación del profesor responsable
+        // Validación de acompañantes
         $profesor_responsable = (int)$_POST['profesor_id'];
-        $departamento_id = (int)$_POST['departamento_id'];
-        $stmt_check_profesor = $conn->prepare("SELECT id FROM profesores WHERE id = ? AND id_departamento = ?");
-        $stmt_check_profesor->bind_param("ii", $profesor_responsable, $departamento_id);
-        $stmt_check_profesor->execute();
-        if (!$stmt_check_profesor->get_result()->num_rows) {
-            throw new Exception("El profesor responsable no pertenece al departamento seleccionado");
+        $acompanantes = isset($_POST['acompanantes']) ? array_map('intval', $_POST['acompanantes']) : [];
+        if (in_array($profesor_responsable, $acompanantes)) {
+            throw new Exception("El responsable no puede ser acompañante");
         }
 
-        // Actualizar actividad
-        $stmt_update = $conn->prepare("UPDATE actividades SET
-            titulo = ?,
-            tipo_id = ?,
-            departamento_id = ?,
+        // Actualizar la actividad principal
+        $stmt = $conn->prepare("UPDATE actividades SET 
+            titulo = ?, 
+            tipo_id = ?, 
+            departamento_id = ?, 
             profesor_id = ?,
-            fecha_inicio = ?,
-            fecha_fin = ?,
-            hora_inicio_id = ?,
+            fecha_inicio = ?, 
+            fecha_fin = ?, 
+            hora_inicio_id = ?, 
             hora_fin_id = ?,
-            coste = ?,
-            total_alumnos = ?,
+            coste = ?, 
+            total_alumnos = ?, 
             objetivo = ?
-        WHERE id = ?");
-        $stmt_update->bind_param(
-            "siiissiidsii",
+            WHERE id = ?");
+        $stmt->bind_param(
+            "siiissiidisi",
             $_POST['titulo'],
             $_POST['tipo_id'],
-            $departamento_id,
-            $profesor_responsable,
+            $_POST['departamento_id'],
+            $_POST['profesor_id'],
             $fecha_inicio->format('Y-m-d'),
             $fecha_fin->format('Y-m-d'),
             $_POST['hora_inicio'],
@@ -126,21 +142,21 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($actividad_id)) {
             $_POST['objetivo'],
             $actividad_id
         );
-        if (!$stmt_update->execute()) {
-            throw new Exception("Error al actualizar la actividad: " . $stmt_update->error);
+        if (!$stmt->execute()) {
+            throw new Exception("Error al actualizar la actividad: " . $stmt->error);
         }
 
-        // Actualizar acompañantes
-        $conn->query("DELETE FROM acompanante WHERE actividad_id = $actividad_id");
-        $acompanantes_nuevos = isset($_POST['acompanantes']) ? array_map('intval', $_POST['acompanantes']) : [];
-        if (!empty($acompanantes_nuevos)) {
-            $stmt_insert_acomp = $conn->prepare("INSERT INTO acompanante (actividad_id, profesor_id) VALUES (?, ?)");
-            foreach ($acompanantes_nuevos as $profesor_id) {
-                if ($profesor_id === $profesor_responsable) {
-                    continue; // El responsable no puede ser acompañante
-                }
-                $stmt_insert_acomp->bind_param("ii", $actividad_id, $profesor_id);
-                $stmt_insert_acomp->execute();
+        // Eliminar acompañantes actuales
+        $stmt = $conn->prepare("DELETE FROM acompañante WHERE actividad_id = ?");
+        $stmt->bind_param("i", $actividad_id);
+        $stmt->execute();
+
+        // Insertar nuevos acompañantes
+        if (!empty($acompanantes)) {
+            $stmt_acomp = $conn->prepare("INSERT INTO acompañante (actividad_id, profesor_id) VALUES (?, ?)");
+            foreach ($acompanantes as $profesor_id) {
+                $stmt_acomp->bind_param("ii", $actividad_id, $profesor_id);
+                $stmt_acomp->execute();
             }
         }
 
@@ -154,66 +170,57 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($actividad_id)) {
     }
 }
 
-// Obtener datos para el formulario
-$departamentos = $conn->query("SELECT * FROM departamento");
-$tipos = $conn->query("SELECT * FROM tipo");
-$horas = $conn->query("SELECT * FROM horas ORDER BY hora");
-
-function getProfesoresByDepartamento($conn, $departamento_id) {
-    $stmt = $conn->prepare("SELECT id, nombre FROM profesores WHERE id_departamento = ?");
-    $stmt->bind_param("i", $departamento_id);
-    $stmt->execute();
-    return $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-}
-
-$conn->close();
+// Cargar profesores del departamento actual para el formulario
+$profesores_departamento = getProfesoresByDepartamento($conn, $actividad['departamento_id']);
 ?>
 <!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>✏️ Editar Actividad</title>
+    <title>Editar Actividad</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <script>
         function cargarProfesores() {
             const departamentoId = document.getElementById('departamento_id').value;
             const profesorSelect = document.getElementById('profesor_id');
-            const accompanyDiv = document.getElementById('acompany-div');
+            const acompanantesSelect = document.getElementById('acompanantes');
 
             fetch(`get_profesores.php?departamento_id=${departamentoId}`)
                 .then(response => response.json())
                 .then(profesores => {
                     profesorSelect.innerHTML = '<option value="">Seleccionar...</option>';
-                    accompanyDiv.innerHTML = '';
+                    acompanantesSelect.innerHTML = '';
 
                     profesores.forEach(profesor => {
                         const option = document.createElement('option');
                         option.value = profesor.id;
                         option.textContent = profesor.nombre;
-                        profesorSelect.appendChild(option);
+                        profesorSelect.appendChild(option.cloneNode(true));
 
-                        const checkbox = document.createElement('div');
-                        checkbox.className = 'form-check';
-                        checkbox.innerHTML = `
-                            <input class="form-check-input" type="checkbox" name="acompanantes[]" value="${profesor.id}" id="accompanie-${profesor.id}">
-                            <label class="form-check-label" for="accompanie-${profesor.id}">${profesor.nombre}</label>
-                        `;
-                        accompanyDiv.appendChild(checkbox);
-
-                        // Marcar checkboxes de acompañantes actuales
-                        if (<?= json_encode($acompanantes_actuales ?? []) ?>.includes(profesor.id)) {
-                            document.getElementById(`accompanie-${profesor.id}`).checked = true;
-                        }
+                        const acompananteOption = option.cloneNode(true);
+                        acompanantesSelect.appendChild(acompananteOption);
                     });
+                    
+                    // Establecer el profesor responsable
+                    if (profesorSelect.querySelector(`option[value="${document.getElementById('current_profesor_id').value}"]`)) {
+                        profesorSelect.value = document.getElementById('current_profesor_id').value;
+                    }
+                    
+                    // Seleccionar acompañantes actuales
+                    const currentAcompanantes = JSON.parse(document.getElementById('current_acompanantes').value);
+                    for (const profesorId of currentAcompanantes) {
+                        const option = acompanantesSelect.querySelector(`option[value="${profesorId}"]`);
+                        if (option) option.selected = true;
+                    }
                 })
                 .catch(error => console.error('Error al cargar profesores:', error));
         }
-
-        function validateNumericInput(event) {
-            const input = event.target;
-            input.value = input.value.replace(/[^0-9.]/g, '');
-        }
+        
+        // Al cargar la página
+        document.addEventListener('DOMContentLoaded', function() {
+            cargarProfesores();
+        });
     </script>
 </head>
 <body>
@@ -223,16 +230,21 @@ $conn->close();
         <div class="alert alert-danger"><?= htmlspecialchars($error) ?></div>
     <?php endif; ?>
     <form method="POST" onsubmit="return validarFormulario()">
+        <!-- Campos ocultos para el JS -->
+        <input type="hidden" id="current_profesor_id" value="<?= $actividad['profesor_id'] ?>">
+        <input type="hidden" id="current_acompanantes" value='<?= json_encode($acompanantes_actuales) ?>'>
+        
         <!-- Información Básica -->
         <div class="mb-3">
             <label for="titulo">Título</label>
-            <input type="text" id="titulo" name="titulo" class="form-control" value="<?= htmlspecialchars($actividad['titulo']) ?>" required>
+            <input type="text" id="titulo" name="titulo" class="form-control" required value="<?= htmlspecialchars($actividad['titulo']) ?>">
         </div>
         <div class="mb-3">
             <label for="tipo_id">Tipo</label>
             <select id="tipo_id" name="tipo_id" class="form-select" required>
+                <option value="">Seleccionar...</option>
                 <?php while ($tipo = $tipos->fetch_assoc()): ?>
-                    <option value="<?= $tipo['id'] ?>" <?= $tipo['id'] == $actividad['tipo_id'] ? 'selected' : '' ?>>
+                    <option value="<?= $tipo['id'] ?>" <?= $actividad['tipo_id'] == $tipo['id'] ? 'selected' : '' ?>>
                         <?= htmlspecialchars($tipo['nombre']) ?>
                     </option>
                 <?php endwhile; ?>
@@ -243,7 +255,7 @@ $conn->close();
             <select id="departamento_id" name="departamento_id" class="form-select" required onchange="cargarProfesores()">
                 <option value="">Seleccionar...</option>
                 <?php while ($dep = $departamentos->fetch_assoc()): ?>
-                    <option value="<?= $dep['id'] ?>" <?= $dep['id'] == $actividad['departamento_id'] ? 'selected' : '' ?>>
+                    <option value="<?= $dep['id'] ?>" <?= $actividad['departamento_id'] == $dep['id'] ? 'selected' : '' ?>>
                         <?= htmlspecialchars($dep['nombre']) ?>
                     </option>
                 <?php endwhile; ?>
@@ -253,23 +265,24 @@ $conn->close();
             <label for="profesor_id">Responsable</label>
             <select id="profesor_id" name="profesor_id" class="form-select" required>
                 <option value="">Cargando...</option>
+                <!-- Opciones cargadas dinámicamente -->
             </select>
         </div>
 
         <!-- Fechas y Horas -->
         <div class="mb-3">
             <label for="fecha_inicio">Fecha Inicio</label>
-            <input type="date" id="fecha_inicio" name="fecha_inicio" class="form-control" value="<?= $actividad['fecha_inicio'] ?>" required>
+            <input type="date" id="fecha_inicio" name="fecha_inicio" class="form-control" required value="<?= $actividad['fecha_inicio'] ?>">
         </div>
         <div class="mb-3">
             <label for="fecha_fin">Fecha Fin</label>
-            <input type="date" id="fecha_fin" name="fecha_fin" class="form-control" value="<?= $actividad['fecha_fin'] ?>" required>
+            <input type="date" id="fecha_fin" name="fecha_fin" class="form-control" required value="<?= $actividad['fecha_fin'] ?>">
         </div>
         <div class="mb-3">
             <label for="hora_inicio">Hora Inicio</label>
             <select id="hora_inicio" name="hora_inicio" class="form-select" required>
                 <?php $horas->data_seek(0); while ($hora = $horas->fetch_assoc()): ?>
-                    <option value="<?= $hora['id'] ?>" <?= $hora['id'] == $actividad['hora_inicio_id'] ? 'selected' : '' ?>>
+                    <option value="<?= $hora['id'] ?>" <?= $actividad['hora_inicio_id'] == $hora['id'] ? 'selected' : '' ?>>
                         <?= date('H:i', strtotime($hora['hora'])) ?>
                     </option>
                 <?php endwhile; ?>
@@ -279,7 +292,7 @@ $conn->close();
             <label for="hora_fin">Hora Fin</label>
             <select id="hora_fin" name="hora_fin" class="form-select" required>
                 <?php $horas->data_seek(0); while ($hora = $horas->fetch_assoc()): ?>
-                    <option value="<?= $hora['id'] ?>" <?= $hora['id'] == $actividad['hora_fin_id'] ? 'selected' : '' ?>>
+                    <option value="<?= $hora['id'] ?>" <?= $actividad['hora_fin_id'] == $hora['id'] ? 'selected' : '' ?>>
                         <?= date('H:i', strtotime($hora['hora'])) ?>
                     </option>
                 <?php endwhile; ?>
@@ -289,22 +302,26 @@ $conn->close();
         <!-- Detalles -->
         <div class="mb-3">
             <label for="coste">Coste (€)</label>
-            <input type="text" id="coste" name="coste" class="form-control" value="<?= $actividad['coste'] ?>" oninput="validateNumericInput(event)" required>
+            <input type="number" step="0.01" id="coste" name="coste" class="form-control" required value="<?= $actividad['coste'] ?>">
         </div>
         <div class="mb-3">
             <label for="total_alumnos">Alumnos</label>
-            <input type="text" id="total_alumnos" name="total_alumnos" class="form-control" value="<?= $actividad['total_alumnos'] ?>" oninput="validateNumericInput(event)" required>
+            <input type="number" id="total_alumnos" name="total_alumnos" class="form-control" required value="<?= $actividad['total_alumnos'] ?>">
         </div>
         <div class="mb-3">
             <label for="objetivo">Objetivo</label>
             <textarea id="objetivo" name="objetivo" class="form-control" rows="3" required><?= htmlspecialchars($actividad['objetivo']) ?></textarea>
         </div>
         <div class="mb-3">
-            <label>Acompañantes</label>
-            <div id="acompany-div"></div>
+            <label for="acompanantes">Acompañantes</label>
+            <select id="acompanantes" name="acompanantes[]" class="form-select" multiple>
+                <!-- Opciones cargadas dinámicamente -->
+            </select>
         </div>
-        <button class="btn btn-primary">Guardar Cambios</button>
-        <a href="index.php" class="btn btn-secondary">Cancelar</a>
+        <div class="d-flex gap-2">
+            <button type="submit" class="btn btn-primary">Guardar Cambios</button>
+            <a href="index.php" class="btn btn-secondary">Cancelar</a>
+        </div>
     </form>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
@@ -321,15 +338,17 @@ $conn->close();
         }
 
         if (fechaInicio.toDateString() === fechaFin.toDateString()) {
-            if (new Date(`1970-01-01T${horaFin}`) <= new Date(`1970-01-01T${horaInicio}`)) {
-                alert('La hora final debe ser posterior a la hora inicial en el mismo día.');
+            const tiempoInicio = parseInt(horaInicio);
+            const tiempoFin = parseInt(horaFin);
+            if (tiempoFin < tiempoInicio) {
+                alert('La hora final no puede ser anterior a la hora inicial en el mismo día.');
                 return false;
             }
         }
 
         const responsable = parseInt(document.getElementById('profesor_id').value);
-        const acompanantes = Array.from(document.querySelectorAll('#acompany-div input[type=checkbox]:checked'))
-            .map(checkbox => parseInt(checkbox.value));
+        const acompanantes = Array.from(document.querySelectorAll('#acompanantes option:checked'))
+            .map(option => parseInt(option.value));
 
         if (acompanantes.includes(responsable)) {
             alert('El responsable no puede ser acompañante.');
@@ -338,14 +357,6 @@ $conn->close();
 
         return true;
     }
-
-    // Cargar profesores al cargar la página
-    window.onload = function () {
-        const departamentoId = <?= $actividad['departamento_id'] ?>;
-        if (departamentoId) {
-            cargarProfesores(departamentoId);
-        }
-    };
 </script>
 </body>
 </html>
